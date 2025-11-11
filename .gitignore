@@ -1,4 +1,6 @@
 .vs/
 build/
 video_test/
+out/
+CMakeSettings.json
 
