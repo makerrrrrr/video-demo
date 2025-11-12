@@ -2,18 +2,26 @@
 #include <iomanip>
 #include <iostream>
 #include <sstream>
+#include <string>
 
 #include "frame_batch.hpp"
 #include "frame_extractor.hpp"
 #include <opencv2/imgcodecs.hpp>
 
-int main() {
+int main(int argc, char** argv) {
     const std::filesystem::path input_dir = "saved_videos";
     const std::filesystem::path output_dir = "extracted_frames";
     std::filesystem::create_directories(output_dir);
     BlockingQueue<FrameBatch> queue;
 
-    extract_frames_single(input_dir, queue);
+    const bool use_parallel = argc > 1 && std::string(argv[1]) == "--parallel";
+    if (!use_parallel) {
+        std::cout << "使用多线程抽帧模式。" << std::endl;
+        extract_frames_parallel(input_dir, queue);
+    } else {
+        std::cout << "使用单线程抽帧模式。" << std::endl;
+        extract_frames_single(input_dir, queue);
+    }
 
     std::size_t batch_count = 0;
     std::size_t logged = 0;
