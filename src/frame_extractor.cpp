@@ -93,7 +93,7 @@ void reader_worker(VideoStream stream,
             break;
         }
         // 读到了帧，打包成FramePacket(摄像头ID,帧索引,帧数据,是否是最后一帧)，放入共享队列
-        packet_queue.push({stream.cam_id, frame_index++, frame, false});
+        packet_queue.push({stream.cam_id, frame_index++, frame.clone(), false});
     }
     //读完了，将空帧打包成一帧，放入共享队列，标志读取线程结束
     packet_queue.push({stream.cam_id, frame_index, cv::Mat(), true});
