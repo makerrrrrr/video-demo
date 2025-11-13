@@ -153,37 +153,34 @@ void extract_frames_single(const std::filesystem::path& input_dir,
 // 多线程遍历输入目录下的视频，同步抽帧并推送到队列。
 // 读完或遇到错误后自动关闭队列。
 void extract_frames_parallel(const std::filesystem::path& input_dir,
-                             BlockingQueue<FrameBatch>& output_queue) {
+                              BlockingQueue<FrameBatch>& output_queue) {
     if (!std::filesystem::exists(input_dir)) {
         std::cerr << "输入目录不存在: " << input_dir << std::endl;
         output_queue.close();
         return;
     }
-    //1、收集视频流
+
     auto streams = collect_streams(input_dir);
     if (streams.empty()) {
         std::cerr << "目录中未找到可用视频: " << input_dir << std::endl;
         output_queue.close();
         return;
     }
-    //2、创建共享资源
-    BlockingQueue<FramePacket> packet_queue; //所有读取线程都往这里放帧数据包
-    std::atomic<bool> stop_flag = false; //停止信号，所有线程都用这个标志来决定是否停止
 
-    std::vector<std::thread> workers; //创建线程数组
-    workers.reserve(streams.size()); //预分配容量为streams.size()，减少后续添加线程时的重分配
+    BlockingQueue<FramePacket> packet_queue;
+    std::atomic<bool> stop_flag = false;
+    std::vector<std::thread> workers;
+    workers.reserve(streams.size());
 
-    std::vector<double> fps_values; //创建帧率数组
-    fps_values.reserve(streams.size()); //预分配帧率容量
+    std::vector<double> fps_values;
+    fps_values.reserve(streams.size());
 
-    //当workers.emplace_back执行时，会创建一个std::thread对象并立即启动线程，开始执行reader_worker函数
     for (auto& stream : streams) {
         fps_values.push_back(stream.fps);
-        workers.emplace_back(reader_worker,//要执行的函数
+        workers.emplace_back(reader_worker,
                              std::move(stream),
-                             //参数1，std::move(stream)将stream移动到新线程，VideoStream 包含 std::unique_ptr<cv::VideoCapture>，不可复制，只能移动,移动后原stream不可再用
-                             std::ref(packet_queue),//参数2，传递引用，多线程共享同一队列
-                             std::ref(stop_flag));//参数3，传递引用，多线程共享同一停止标注
+                             std::ref(packet_queue),
+                             std::ref(stop_flag));
     }
     streams.clear();
 
@@ -201,36 +198,28 @@ void extract_frames_parallel(const std::filesystem::path& input_dir,
         }
     }
 
-    //3、创建帧缓冲区
-    //frame_buffer[帧索引][摄像头ID] = 图像
     std::map<int, std::map<int, cv::Mat>> frame_buffer;
-    std::size_t finished_cams = 0; //已读完的摄像头数量
-    int next_batch_index = 0; //下一帧的索引
-    int first_eof_frame_index = -1; //第一个EOF的帧索引（模拟单线程行为：第一个摄像头读完就停止）
-    
+    std::size_t finished_cams = 0;
+    int next_batch_index = 0;
+    int first_eof_frame_index = -1;
+    std::map<int, int> cam_eof_indices;
+
     // 辅助函数：尝试输出已收齐的帧批次
     auto try_output_complete_batches = [&]() {
         while (true) {
-            // 如果已收到第一个EOF，且当前帧索引 >= EOF的帧索引，说明无法再输出更多批次了
-            // EOF的frame_index是下一个应该读取的帧索引，实际最后一个有效帧是frame_index-1
-            // 所以当next_batch_index >= first_eof_frame_index时，说明已经处理完所有有效帧
             if (first_eof_frame_index >= 0 && next_batch_index >= first_eof_frame_index) {
                 break;
             }
-            
+
             auto it = frame_buffer.find(next_batch_index);
             if (it == frame_buffer.end()) {
-                // 这个帧索引的批次还没有收齐，无法继续输出后续批次
                 break;
             }
-            
-            // 检查这个批次是否完整（所有摄像头都有这一帧）
+
             if (it->second.size() != total_cams) {
-                // 批次不完整，无法输出，停止检查后续批次
                 break;
             }
-            
-            //当某个帧号收齐所有摄像头时，组装成FrameBatch对象，推送到输出队列
+
             FrameBatch batch;
             batch.frame_index = next_batch_index;
             batch.timestamp = reference_fps > 0.0 ? static_cast<double>(next_batch_index) / reference_fps : 0.0;
@@ -240,114 +229,74 @@ void extract_frames_parallel(const std::filesystem::path& input_dir,
             ++next_batch_index;
         }
     };
-    
-    //4、主循环：不断从队列取数据包
+
     while (finished_cams < total_cams) {
-        auto packet_opt = packet_queue.pop(); //从队列中取一个数据包
+        auto packet_opt = packet_queue.pop();
         if (!packet_opt) {
-            // 如果队列已关闭且没有更多数据包，但还有摄像头未完成，继续等待
             if (packet_queue.closed() && finished_cams < total_cams) {
-                // 队列已关闭但还有摄像头未完成，可能是异常情况
                 break;
             }
             continue;
         }
 
         FramePacket packet = std::move(*packet_opt);
-        if (packet.eof) { //如果是结束包
-            ++finished_cams; //记录：又一个摄像头读完了
+        if (packet.eof) {
+            cam_eof_indices[packet.cam_id] = packet.frame_index;
+            ++finished_cams;
+
             if (first_eof_frame_index < 0) {
-                // 收到第一个EOF，记录帧索引（模拟单线程行为：第一个摄像头读完就停止）
-                // EOF的frame_index是下一个应该读取的帧索引，实际最后一个有效帧是frame_index-1
-                // 所以应该输出frame_index 0到first_eof_frame_index-1的帧批次
                 first_eof_frame_index = packet.frame_index;
-                stop_flag.store(true); //设置停止信号
+            } else {
+                first_eof_frame_index = std::min(first_eof_frame_index, packet.frame_index);
             }
-            // 收到EOF后，尝试输出已收齐的批次（可能其他摄像头已经读取了更多帧）
+            //确保所有摄像头都读完后才设置停止标志
+            if(finished_cams == total_cams) {
+                stop_flag.store(true);
+            }
             try_output_complete_batches();
-            continue; 
+            continue;
         }
 
-        //// 如果已收到第一个EOF，且这个帧包的索引 >= EOF的帧索引，跳过（无法组成完整批次）
-        //// EOF的frame_index是下一个应该读取的帧索引，实际最后一个有效帧是frame_index-1
-        //// 所以frame_index >= first_eof_frame_index的帧包应该被跳过
-        //if (first_eof_frame_index >= 0 && packet.frame_index >= first_eof_frame_index) {
-        //    continue;
-        //}
-		// 记录每个摄像头的EOF帧索引
-		std::map<int, int> cam_eof_indices;
+        auto eof_it = cam_eof_indices.find(packet.cam_id);
+        if (eof_it != cam_eof_indices.end() && packet.frame_index >= eof_it->second) {
+            continue;
+        }
 
-		// 在EOF处理部分：
-		if (packet.eof) {
-			cam_eof_indices[packet.cam_id] = packet.frame_index;
-			++finished_cams;
-
-			if (first_eof_frame_index < 0) {
-				first_eof_frame_index = packet.frame_index;
-				stop_flag.store(true);
-			}
-			continue;
-		}
-
-		// 帧处理时检查：只有当该摄像头已EOF且帧索引>=其EOF索引时才跳过
-		auto eof_it = cam_eof_indices.find(packet.cam_id);
-		if (eof_it != cam_eof_indices.end() && packet.frame_index >= eof_it->second) {
-			continue;
-		}
-
-        //正常帧包：存入缓冲区
         auto& frames_for_index = frame_buffer[packet.frame_index];
         frames_for_index.emplace(packet.cam_id, std::move(packet.frame));
-        //尝试组装并输出已收齐的帧批次
         try_output_complete_batches();
     }
-    
-    //5、清理资源
-    // 先设置停止信号，等待所有读取线程结束
+
     stop_flag.store(true);
     for (auto& worker : workers) {
         if (worker.joinable()) {
-            worker.join();//等待这个线程完成
+            worker.join();
         }
     }
-    
-    // 关闭packet_queue，这样后续的pop()调用不会一直阻塞
+
     packet_queue.close();
-    
-    // 继续处理队列中剩余的数据包，直到队列为空
-    // 只处理小于first_eof_frame_index的帧包（模拟单线程行为）
+
     while (true) {
         auto packet_opt = packet_queue.pop();
         if (!packet_opt) {
-            break; // 队列已关闭且为空
+            break;
         }
-        
+
         FramePacket packet = std::move(*packet_opt);
         if (packet.eof) {
-            // 如果还有EOF包，说明之前计数有误，但这里已经不重要了
             continue;
         }
-        
-        // 如果已收到第一个EOF，且这个帧包的索引 >= EOF的帧索引，跳过（无法组成完整批次）
-        // EOF的frame_index是下一个应该读取的帧索引，实际最后一个有效帧是frame_index-1
-        // 所以frame_index >= first_eof_frame_index的帧包应该被跳过
-        if (first_eof_frame_index >= 0 && packet.frame_index >= first_eof_frame_index) {
+
+        auto eof_it = cam_eof_indices.find(packet.cam_id);
+        if (eof_it != cam_eof_indices.end() && packet.frame_index >= eof_it->second) {
             continue;
         }
-        
-        //正常帧包：存入缓冲区
+
         auto& frames_for_index = frame_buffer[packet.frame_index];
         frames_for_index.emplace(packet.cam_id, std::move(packet.frame));
-        //尝试组装并输出已收齐的帧批次
         try_output_complete_batches();
     }
-    
-    // 所有摄像头都读完后，再次尝试输出缓冲区中剩余的完整帧批次
-    // 使用try_output_complete_batches函数来处理，它会正确处理EOF边界条件
+
     try_output_complete_batches();
-    
-    //关闭输出队列
     output_queue.close();
 }
-
-
