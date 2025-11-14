@@ -9,9 +9,5 @@
 void extract_frames_single(const std::filesystem::path& input_dir,
                            BlockingQueue<FrameBatch>& output_queue);
 
-// 多线程遍历输入目录下的视频，同步抽帧并推送到队列。
-// 读完或遇到错误后自动关闭队列。
-void extract_frames_parallel(const std::filesystem::path& input_dir,
-                             BlockingQueue<FrameBatch>& output_queue);
 
 

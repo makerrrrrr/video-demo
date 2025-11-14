@@ -1,12 +1,10 @@
 #include "frame_extractor.hpp"
 
 #include <algorithm>
-#include <atomic>
 #include <iostream>
 #include <memory>
 #include <map>
 #include <opencv2/opencv.hpp>
-#include <thread>
 #include <vector>
 
 namespace {
@@ -74,31 +72,8 @@ std::vector<VideoStream> collect_streams(const std::filesystem::path& input_dir)
     return streams;
 }
 
-// 多线程抽帧中间结构体，用于在读取线程和调度线程之前传递单个摄像头的帧数据
-struct FramePacket {
-    int cam_id = -1;
-    int frame_index = -1;
-    cv::Mat frame;
-    bool eof = false;
-};
-//render_worker：每个摄像头一个线程，负责读取该视频的所有帧
-//packet_queue:所有读取线程把帧数据包放入这个共享队列
-void reader_worker(VideoStream stream,
-                   BlockingQueue<FramePacket>& packet_queue,
-                   std::atomic<bool>& stop_flag) {
-    int frame_index = 0;
-    cv::Mat frame;
-    while (!stop_flag.load()) {
-        if (!stream.cap->read(frame)) {
-            break;
-        }
-        // 读到了帧，打包成FramePacket(摄像头ID,帧索引,帧数据,是否是最后一帧)，放入共享队列
-        packet_queue.push({stream.cam_id, frame_index++, frame.clone(), false});
-    }
-    //读完了，将空帧打包成一帧，放入共享队列，标志读取线程结束
-    packet_queue.push({stream.cam_id, frame_index, cv::Mat(), true});
-}
-}  // namespace
+} // namespace
+
 // 单线程遍历输入目录下的所有视频，按帧生成批次并推送到队列。
 // 读完或遇到错误后自动关闭队列。
 void extract_frames_single(const std::filesystem::path& input_dir,
@@ -147,156 +122,5 @@ void extract_frames_single(const std::filesystem::path& input_dir,
         ++frame_index;
     }
 
-    output_queue.close();
-}
-
-// 多线程遍历输入目录下的视频，同步抽帧并推送到队列。
-// 读完或遇到错误后自动关闭队列。
-void extract_frames_parallel(const std::filesystem::path& input_dir,
-                              BlockingQueue<FrameBatch>& output_queue) {
-    if (!std::filesystem::exists(input_dir)) {
-        std::cerr << "输入目录不存在: " << input_dir << std::endl;
-        output_queue.close();
-        return;
-    }
-
-    auto streams = collect_streams(input_dir);
-    if (streams.empty()) {
-        std::cerr << "目录中未找到可用视频: " << input_dir << std::endl;
-        output_queue.close();
-        return;
-    }
-
-    BlockingQueue<FramePacket> packet_queue;
-    std::atomic<bool> stop_flag = false;
-    std::vector<std::thread> workers;
-    workers.reserve(streams.size());
-
-    std::vector<double> fps_values;
-    fps_values.reserve(streams.size());
-
-    for (auto& stream : streams) {
-        fps_values.push_back(stream.fps);
-        workers.emplace_back(reader_worker,
-                             std::move(stream),
-                             std::ref(packet_queue),
-                             std::ref(stop_flag));
-    }
-    streams.clear();
-
-    const std::size_t total_cams = fps_values.size();
-    if (total_cams == 0) {
-        output_queue.close();
-        return;
-    }
-
-    double reference_fps = 0.0;
-    for (double fps : fps_values) {
-        if (fps > 0.0) {
-            reference_fps = fps;
-            break;
-        }
-    }
-
-    std::map<int, std::map<int, cv::Mat>> frame_buffer;
-    std::size_t finished_cams = 0;
-    int next_batch_index = 0;
-    int first_eof_frame_index = -1;
-    std::map<int, int> cam_eof_indices;
-
-    // 辅助函数：尝试输出已收齐的帧批次
-    auto try_output_complete_batches = [&]() {
-        while (true) {
-            if (first_eof_frame_index >= 0 && next_batch_index >= first_eof_frame_index) {
-                break;
-            }
-
-            auto it = frame_buffer.find(next_batch_index);
-            if (it == frame_buffer.end()) {
-                break;
-            }
-
-            if (it->second.size() != total_cams) {
-                break;
-            }
-
-            FrameBatch batch;
-            batch.frame_index = next_batch_index;
-            batch.timestamp = reference_fps > 0.0 ? static_cast<double>(next_batch_index) / reference_fps : 0.0;
-            batch.frames = std::move(it->second);
-            frame_buffer.erase(it);
-            output_queue.push(std::move(batch));
-            ++next_batch_index;
-        }
-    };
-
-    while (finished_cams < total_cams) {
-        auto packet_opt = packet_queue.pop();
-        if (!packet_opt) {
-            if (packet_queue.closed() && finished_cams < total_cams) {
-                break;
-            }
-            continue;
-        }
-
-        FramePacket packet = std::move(*packet_opt);
-        if (packet.eof) {
-            cam_eof_indices[packet.cam_id] = packet.frame_index;
-            ++finished_cams;
-
-            if (first_eof_frame_index < 0) {
-                first_eof_frame_index = packet.frame_index;
-            } else {
-                first_eof_frame_index = std::min(first_eof_frame_index, packet.frame_index);
-            }
-            //确保所有摄像头都读完后才设置停止标志
-            if(finished_cams == total_cams) {
-                stop_flag.store(true);
-            }
-            try_output_complete_batches();
-            continue;
-        }
-
-        auto eof_it = cam_eof_indices.find(packet.cam_id);
-        if (eof_it != cam_eof_indices.end() && packet.frame_index >= eof_it->second) {
-            continue;
-        }
-
-        auto& frames_for_index = frame_buffer[packet.frame_index];
-        frames_for_index.emplace(packet.cam_id, std::move(packet.frame));
-        try_output_complete_batches();
-    }
-
-    stop_flag.store(true);
-    for (auto& worker : workers) {
-        if (worker.joinable()) {
-            worker.join();
-        }
-    }
-
-    packet_queue.close();
-
-    while (true) {
-        auto packet_opt = packet_queue.pop();
-        if (!packet_opt) {
-            break;
-        }
-
-        FramePacket packet = std::move(*packet_opt);
-        if (packet.eof) {
-            continue;
-        }
-
-        auto eof_it = cam_eof_indices.find(packet.cam_id);
-        if (eof_it != cam_eof_indices.end() && packet.frame_index >= eof_it->second) {
-            continue;
-        }
-
-        auto& frames_for_index = frame_buffer[packet.frame_index];
-        frames_for_index.emplace(packet.cam_id, std::move(packet.frame));
-        try_output_complete_batches();
-    }
-
-    try_output_complete_batches();
     output_queue.close();
 }
